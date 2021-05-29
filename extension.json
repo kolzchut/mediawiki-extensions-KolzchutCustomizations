@@ -1,0 +1,38 @@
+{
+	"name": "KolzchutCustomizations",
+	"author": [
+		"Dror S. [FFS] ([http://www.kolzchut.org.il Kol-Zchut])"
+	],
+	"url": "https://github.com/kolzchut/mediawiki-extensions-KolzchutCustomizations",
+	"descriptionmsg": "kolzchutcustomizations-desc",
+	"license-name": "GPL-2.0-or-later",
+	"type": "other",
+	"requires": {
+		"MediaWiki": ">= 1.35.0"
+	},
+	"AutoloadNamespaces": {
+		"MediaWiki\\Extension\\KolzchutCustomizations\\": "includes/"
+	},
+	"config": {
+		"KzCustomOverrideSearchNamespaces": {
+			"description": "Override the default search namespaces",
+			"value": true
+		}
+	},
+	"HookHandlers": {
+		"KzCustomHooks": {
+			"class": "MediaWiki\\Extension\\KolzchutCustomizations\\Hooks",
+			"services": [ "PermissionManager", "MainConfig", "ContentLanguage" ]
+		}
+	},
+	"Hooks": {
+		"UserGetDefaultOptions": "KzCustomHooks",
+		"UserLoadOptions": "KzCustomHooks"
+	},
+	"MessagesDirs": {
+		"KolzchutCustomizations": [
+			"i18n"
+		]
+	},
+	"manifest_version": 2
+}
