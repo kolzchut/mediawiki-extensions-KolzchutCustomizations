@@ -63,9 +63,10 @@ class Hooks implements
 	 * @return bool|void True or no return value to continue or false to abort
 	 */
 	public function onUserGetDefaultOptions( &$defaultOptions ) {
-		$namespaces = $this->contentLanguage->getNamespaceIds();
-		foreach ( $namespaces as $ns ) {
-			$defaultOptions[ 'searchNs' . $ns ] = in_array( $ns, [ NS_MAIN, NS_PROJECT ] );
+		$allNamespaces = $this->contentLanguage->getNamespaceIds();
+		$namespacesToAllow = $this->mainConfig->get( 'NamespacesToBeSearchedDefaultAnon' );
+		foreach ( $allNamespaces as $ns ) {
+			$defaultOptions[ 'searchNs' . $ns ] = in_array( $ns, $namespacesToAllow );
 		}
 	}
 
