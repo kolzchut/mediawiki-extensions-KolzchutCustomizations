@@ -22,11 +22,11 @@ namespace MediaWiki\Extension\KolzchutCustomizations;
 use Config;
 use Language;
 use MediaWiki\Permissions\PermissionManager;
-use User;
+use MediaWiki\User\UserIdentity;
 
 class Hooks implements
 	\MediaWiki\User\Hook\UserGetDefaultOptionsHook,
-	\MediaWiki\User\Hook\UserLoadOptionsHook
+	\MediaWiki\User\Options\Hook\LoadUserOptionsHook
 {
 
 	/** @var PermissionManager */
@@ -76,10 +76,10 @@ class Hooks implements
 	 * So we use onUserGetDefaultOptions() to turn off most namespaces for search,
 	 * then use this to turn them back on for editors.
 	 *
-	 * @param User $user User object
+	 * @param UserIdentity $user User identity object
 	 * @param array &$options Options, can be modified.
 	 */
-	public function onUserLoadOptions( $user, &$options ) {
+	public function onLoadUserOptions( UserIdentity $user, array &$options ): void {
 		if ( $user->isRegistered() &&
 			$this->permissionManager->userHasRight( $user, 'edit' )
 		) {

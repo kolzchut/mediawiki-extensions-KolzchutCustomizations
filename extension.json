@@ -9,7 +9,7 @@
 	"type": "other",
 	"version": "0.1.0",
 	"requires": {
-		"MediaWiki": ">= 1.35.0"
+		"MediaWiki": ">= 1.37.0"
 	},
 	"AutoloadNamespaces": {
 		"MediaWiki\\Extension\\KolzchutCustomizations\\": "includes/"
@@ -28,7 +28,7 @@
 	},
 	"Hooks": {
 		"UserGetDefaultOptions": "KzCustomHooks",
-		"UserLoadOptions": "KzCustomHooks"
+		"LoadUserOptions": "KzCustomHooks"
 	},
 	"MessagesDirs": {
 		"KolzchutCustomizations": [
