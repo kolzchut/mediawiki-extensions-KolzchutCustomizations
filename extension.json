@@ -7,7 +7,7 @@
 	"descriptionmsg": "kolzchutcustomizations-desc",
 	"license-name": "GPL-2.0-or-later",
 	"type": "other",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"requires": {
 		"MediaWiki": ">= 1.37.0"
 	},
@@ -28,7 +28,28 @@
 	},
 	"Hooks": {
 		"UserGetDefaultOptions": "KzCustomHooks",
-		"LoadUserOptions": "KzCustomHooks"
+		"LoadUserOptions": "KzCustomHooks",
+		"BeforePageDisplay": "KzCustomHooks"
+	},
+	"ResourceFileModulePaths": {
+		"localBasePath": "resources",
+		"remoteExtPath": "WikiRights/KolzchutCustomizations/resources"
+	},
+	"ResourceModules": {
+		"ext.KolzchutCustomizations.cityRightsWelcome": {
+			"scripts": [
+				"ext.KolzchutCustomizations.cityRightsWelcome/cityRightsWelcome.js"
+			],
+			"styles": [
+				"ext.KolzchutCustomizations.cityRightsWelcome/cityRightsWelcome.css"
+			],
+			"dependencies": [
+				"mediawiki.util",
+				"mediawiki.cookie",
+				"mediawiki.api",
+				"mediawiki.storage"
+			]
+		}
 	},
 	"MessagesDirs": {
 		"KolzchutCustomizations": [

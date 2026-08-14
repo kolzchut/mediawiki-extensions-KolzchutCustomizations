@@ -26,7 +26,8 @@ use MediaWiki\User\UserIdentity;
 
 class Hooks implements
 	\MediaWiki\User\Hook\UserGetDefaultOptionsHook,
-	\MediaWiki\User\Options\Hook\LoadUserOptionsHook
+	\MediaWiki\User\Options\Hook\LoadUserOptionsHook,
+	\MediaWiki\Hook\BeforePageDisplayHook
 {
 
 	/** @var PermissionManager */
@@ -59,7 +60,7 @@ class Hooks implements
 	 *
 	 * @see https://www.mediawiki.org/wiki/Manual:Hooks/UserGetDefaultOptions
 	 *
-	 * @param array &$defaultOptions Array of preference keys and their default values.
+	 * @param array $defaultOptions Array of preference keys and their default values.
 	 * @return bool|void True or no return value to continue or false to abort
 	 */
 	public function onUserGetDefaultOptions( &$defaultOptions ) {
@@ -77,7 +78,7 @@ class Hooks implements
 	 * then use this to turn them back on for editors.
 	 *
 	 * @param UserIdentity $user User identity object
-	 * @param array &$options Options, can be modified.
+	 * @param array $options Options, can be modified.
 	 */
 	public function onLoadUserOptions( UserIdentity $user, array &$options ): void {
 		if ( $user->isRegistered() &&
@@ -91,6 +92,23 @@ class Hooks implements
 				}
 				$options[ 'searchNs' . $ns ] = true;
 			}
+		}
+	}
+
+	/**
+	 * Load the CityRights partner-welcome module on the wikis that had the
+	 * CityRightsWelcome gadget (main-site he and ar). The module is added on
+	 * every page view, exactly like the `default` gadget it replaces: the
+	 * behaviour is gated client-side on ?utm_source=<partner>, because the
+	 * sites sit behind a shared edge cache and server output must not vary
+	 * on a query parameter.
+	 *
+	 * @param \MediaWiki\Output\OutputPage $out
+	 * @param \Skin $skin
+	 */
+	public function onBeforePageDisplay( $out, $skin ): void {
+		if ( in_array( $this->contentLanguage->getCode(), [ 'he', 'ar' ], true ) ) {
+			$out->addModules( 'ext.KolzchutCustomizations.cityRightsWelcome' );
 		}
 	}
 
