@@ -1,0 +1,109 @@
+/*!
+ * Styles for the CityRights welcome dialog.
+ * Ported from the on-wiki gadget MediaWiki:Gadget-CityRightsWelcome.css.
+ */
+.dismiss-forever {
+	margin-right: 0.5em;
+}
+
+.modal-govt-welcome {
+	text-align: center;
+}
+
+.modal-govt-welcome .headerImage {
+	display: none;
+}
+
+.modal-govt-welcome a {
+	color: #296999;
+}
+
+.modal-govt-welcome .modal-footer-extra-controls label {
+	font-weight: normal;
+}
+
+.modal-govt-welcome h1 {
+	margin-top: 0;
+}
+
+@media ( max-width: 767px ) {
+	.modal-govt-welcome h1 {
+		font-size: 36px;
+	}
+}
+
+.modal-govt-welcome h1,
+.modal-govt-welcome h2,
+.modal-govt-welcome h3 {
+	color: #296999;
+	font-family: 'Na_OE_Pro', 'Arial', sans-serif;
+}
+
+.modal-govt-welcome .modal-content {
+	/* stylelint-disable-next-line declaration-no-important */
+	color: #296999 !important;
+}
+
+.modal-govt-welcome .modal-body {
+	padding: 14px;
+}
+
+.modal-govt-welcome .modal-footer-extra-controls,
+.modal-govt-welcome .modal-footer-extra-controls a {
+	color: #666;
+}
+
+@media ( min-width: 768px ) {
+	.modal-govt-welcome .modal-footer-extra-controls,
+	.modal-govt-welcome .modal-footer-extra-controls a {
+		padding-top: 3em;
+	}
+}
+
+.modal-govt-welcome .modal-footer {
+	border-top: 0;
+	text-align: center;
+	padding-top: 0;
+}
+
+.cityrights-welcome-language-switcher.btn {
+	border: 0;
+}
+
+@media ( min-width: 768px ) and ( min-height: 810px ) {
+	.cityrights-welcome-language-switcher {
+		position: absolute;
+		left: 0;
+		top: 0;
+		z-index: 2;
+	}
+
+	.cityrights-welcome-language-switcher .btn {
+		font-size: 1.5em;
+	}
+
+	.modal-govt-welcome .headerImage {
+		display: block;
+		position: absolute;
+	}
+
+	.modal-govt-welcome .btn-default {
+		padding: 16px 32px;
+	}
+
+	.modal-govt-welcome .modal-dialog {
+		width: 699px;
+	}
+
+	.modal-govt-welcome .inner-content {
+		padding: 226px 3em 0;
+		position: relative;
+		z-index: 1;
+	}
+}
+
+@media ( min-width: 768px ) {
+	.modal-footer-extra-controls .dismiss-forever + .backButton {
+		margin-right: 5em;
+	}
+}
