@@ -60,7 +60,7 @@ class Hooks implements
 	 *
 	 * @see https://www.mediawiki.org/wiki/Manual:Hooks/UserGetDefaultOptions
 	 *
-	 * @param array $defaultOptions Array of preference keys and their default values.
+	 * @param array &$defaultOptions Array of preference keys and their default values.
 	 * @return bool|void True or no return value to continue or false to abort
 	 */
 	public function onUserGetDefaultOptions( &$defaultOptions ) {
@@ -78,7 +78,7 @@ class Hooks implements
 	 * then use this to turn them back on for editors.
 	 *
 	 * @param UserIdentity $user User identity object
-	 * @param array $options Options, can be modified.
+	 * @param array &$options Options, can be modified.
 	 */
 	public function onLoadUserOptions( UserIdentity $user, array &$options ): void {
 		if ( $user->isRegistered() &&
