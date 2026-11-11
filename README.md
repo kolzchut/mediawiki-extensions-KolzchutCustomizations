@@ -35,6 +35,28 @@ Key points:
   localStorage key (`CityRightsSettings`) as the old gadget, so they
   survive the migration.
 
+## Maintenance: removeNonEditorUsers.php
+
+`maintenance/removeNonEditorUsers.php` removes accounts that never edited
+any wiki of the farm (kolzchut/kz#485). The `user`, `actor` and
+`user_groups` tables are shared across `kz_he`/`kz_ar`/`kz_ru`, but edits
+live per wiki, so core's `removeUnusedAccounts.php` (which looks at one wiki)
+must not be used. This script unions edits, deleted edits, uploads and
+non-`newusers` log entries across every wiki in `$wgLocalDatabases`.
+
+It is a **dry run by default** and prints per-tier counts. `--delete` is
+required to delete, and is refused unless every farm wiki was scanned and
+read. Keep filters are cumulative: `--keep-grouped`, `--keep-watchers`,
+`--keep-email-confirmed`, `--ignore-touched N`. `--output-file` writes the
+selected accounts as TSV. System users, reserved names and bot-password
+holders are never deleted. Take a DB snapshot before any `--delete` run;
+there is no undo.
+
+```bash
+php maintenance/run.php extensions/WikiRights/KolzchutCustomizations/maintenance/removeNonEditorUsers.php \
+    --wiki=he --keep-grouped --output-file /tmp/candidates.tsv
+```
+
 ## Configuration
 `$wgNamespacesToBeSearchedDefaultAnon`: an array of namespaces to search by default for anonymous users.
  since we use Google Search for anonymous users, this really only affects the search suggestions.
