@@ -29,7 +29,7 @@ class RemoveNonEditorUsersTest extends MaintenanceBaseTestCase {
 	private const PER_WIKI_TABLES = [
 		'revision', 'archive', 'image', 'oldimage', 'filearchive', 'logging',
 		'recentchanges', 'watchlist', 'watchlist_expiry', 'user_properties',
-		'user_former_groups', 'user_newtalk', 'block', 'site_stats',
+		'user_former_groups', 'user_newtalk', 'block', 'block_target', 'site_stats',
 	];
 
 	private string $currentWiki;
@@ -98,6 +98,46 @@ class RemoveNonEditorUsersTest extends MaintenanceBaseTestCase {
 				'wl_notificationtimestamp' => null,
 			] )
 			->caller( __METHOD__ )->execute();
+	}
+
+	private function addBlockTarget( IDatabase $db, UserIdentity $user ): void {
+		$db->newInsertQueryBuilder()->insertInto( 'block_target' )
+			->row( [
+				'bt_user' => $user->getId(),
+				'bt_user_text' => $user->getName(),
+				'bt_auto' => 0,
+				'bt_count' => 1,
+			] )
+			->caller( __METHOD__ )->execute();
+	}
+
+	private function addNewUsersLog(
+		IDatabase $db, UserIdentity $performer, string $action, string $createdName
+	): void {
+		$db->newInsertQueryBuilder()->insertInto( 'logging' )
+			->row( [
+				'log_type' => 'newusers',
+				'log_action' => $action,
+				'log_timestamp' => $db->timestamp(),
+				'log_actor' => $this->actorId( $performer ),
+				'log_namespace' => NS_USER,
+				'log_title' => str_replace( ' ', '_', $createdName ),
+				'log_comment_id' => 0,
+				'log_params' => '',
+				'log_deleted' => 0,
+			] )
+			->caller( __METHOD__ )->execute();
+	}
+
+	private function countNewUsersLog( IDatabase $db, UserIdentity $performer, string $action ): int {
+		return (int)$db->newSelectQueryBuilder()
+			->select( 'COUNT(*)' )->from( 'logging' )
+			->where( [
+				'log_type' => 'newusers',
+				'log_action' => $action,
+				'log_actor' => $this->actorId( $performer ),
+			] )
+			->caller( __METHOD__ )->fetchField();
 	}
 
 	/**
@@ -222,6 +262,97 @@ class RemoveNonEditorUsersTest extends MaintenanceBaseTestCase {
 		$systemUser = User::newSystemUser( 'Kzc system user', [ 'steal' => true ] );
 
 		$this->assertNotContains( $systemUser->getName(), $this->runScript() );
+	}
+
+	public function testBlockedUserOnAnyFarmWikiIsNeverSelected() {
+		$blockedHere = $this->newUser();
+		$blockedElsewhere = $this->newUser();
+		$this->addBlockTarget( $this->getDb(), $blockedHere );
+		$this->addBlockTarget( $this->otherDb(), $blockedElsewhere );
+
+		$selected = $this->runScript();
+
+		$this->assertNotContains( $blockedHere->getName(), $selected );
+		$this->assertNotContains( $blockedElsewhere->getName(), $selected,
+			'a block on another farm wiki must keep the user' );
+		$this->expectOutputRegex( '/protected, blocked account\s*:\s*2\s/' );
+	}
+
+	public function testBlockedUserSurvivesDelete() {
+		$blocked = $this->newUser();
+		$this->addBlockTarget( $this->otherDb(), $blocked );
+		$neverEdited = $this->newUser();
+
+		$this->runScript( [ 'keep-grouped' => true, 'delete' => true ] );
+
+		$this->assertFalse( $this->userExists( $neverEdited ) );
+
+		$this->assertTrue( $this->userExists( $blocked ) );
+	}
+
+	public function testUnreadableBlockTargetIsFatal() {
+		$neverEdited = $this->newUser();
+		$this->otherDb()->query( 'DROP TEMPORARY TABLE '
+			. $this->otherDb()->addIdentifierQuotes( self::OTHER_PREFIX . 'block_target' ), __METHOD__ );
+
+		try {
+			$this->runScript( [ 'delete' => true ] );
+			$this->fail( 'expected the script to refuse' );
+		} catch ( MaintenanceFatalError $e ) {
+			$this->assertTrue( $this->userExists( $neverEdited ) );
+		}
+		$this->expectOutputRegex( '/Cannot read block_target on .*kzcother_/' );
+	}
+
+	public function testCreatingAnotherAccountKeepsTheUser() {
+		$creator = $this->newUser();
+		$emailCreator = $this->newUser();
+		$selfCreated = $this->newUser();
+		$autoCreated = $this->newUser();
+		$this->addNewUsersLog( $this->getDb(), $creator, 'create', $creator->getName() );
+		$this->addNewUsersLog( $this->otherDb(), $creator, 'create2', 'Someone else' );
+		$this->addNewUsersLog( $this->getDb(), $emailCreator, 'byemail', 'Someone by email' );
+		$this->addNewUsersLog( $this->getDb(), $selfCreated, 'create', $selfCreated->getName() );
+		$this->addNewUsersLog( $this->otherDb(), $autoCreated, 'autocreate', $autoCreated->getName() );
+
+		$selected = $this->runScript();
+
+		$this->assertNotContains( $creator->getName(), $selected,
+			'a create2 entry on another farm wiki means a person acted' );
+		$this->assertNotContains( $emailCreator->getName(), $selected,
+			'a byemail entry means a person acted' );
+		$this->assertContains( $selfCreated->getName(), $selected,
+			'the user\'s own create entry is not a footprint' );
+		$this->assertContains( $autoCreated->getName(), $selected,
+			'the user\'s own autocreate entry is not a footprint' );
+	}
+
+	public function testDeleteRemovesOnlyOwnCreationLogRows() {
+		$creator = $this->newUser();
+		$selfCreated = $this->newUser();
+		$autoCreated = $this->newUser();
+		$this->addNewUsersLog( $this->getDb(), $creator, 'create', $creator->getName() );
+		$this->addNewUsersLog( $this->getDb(), $creator, 'create2', 'Someone else' );
+		$this->addNewUsersLog( $this->getDb(), $selfCreated, 'create', $selfCreated->getName() );
+		$this->addNewUsersLog( $this->otherDb(), $autoCreated, 'autocreate', $autoCreated->getName() );
+		$selfActor = $this->actorId( $selfCreated );
+
+		$this->runScript( [ 'keep-grouped' => true, 'delete' => true ] );
+
+		$this->assertTrue( $this->userExists( $creator ) );
+		$this->assertSame( 1, $this->countNewUsersLog( $this->getDb(), $creator, 'create2' ),
+			'the record of creating another account must survive' );
+		$this->assertSame( 1, $this->countNewUsersLog( $this->getDb(), $creator, 'create' ),
+			'a kept user keeps their own creation entry' );
+		$this->assertFalse( $this->userExists( $selfCreated ) );
+		$this->assertFalse( $this->userExists( $autoCreated ) );
+		$this->assertSame( 0, (int)$this->getDb()->newSelectQueryBuilder()
+			->select( 'COUNT(*)' )->from( 'logging' )->where( [ 'log_actor' => $selfActor ] )
+			->caller( __METHOD__ )->fetchField(), 'a deleted user\'s own create entry is removed' );
+		$this->assertSame( 0, (int)$this->otherDb()->newSelectQueryBuilder()
+			->select( 'COUNT(*)' )->from( 'logging' )
+			->where( [ 'log_type' => 'newusers', 'log_action' => 'autocreate' ] )
+			->caller( __METHOD__ )->fetchField(), 'a deleted user\'s own autocreate entry is removed' );
 	}
 
 	public function testDryRunDeletesNothing() {
