@@ -42,18 +42,26 @@ any wiki of the farm (kolzchut/kz#485). The `user`, `actor` and
 `user_groups` tables are shared across `kz_he`/`kz_ar`/`kz_ru`, but edits
 live per wiki, so core's `removeUnusedAccounts.php` (which looks at one wiki)
 must not be used. This script unions edits, deleted edits, uploads and
-non-`newusers` log entries across every wiki in `$wgLocalDatabases`.
+log entries across every wiki in `$wgLocalDatabases`. The only log entry
+that does not count is the user's own account creation (`newusers` with
+action `create` or `autocreate`); creating someone else's account
+(`create2`, `byemail`) keeps the user. Only those own-creation entries are
+deleted with an account.
 
 It is a **dry run by default** and prints per-tier counts. `--delete` is
 required to delete, and is refused unless every farm wiki was scanned and
 read. Keep filters are cumulative: `--keep-grouped`, `--keep-watchers`,
 `--keep-email-confirmed`, `--ignore-touched N`. `--output-file` writes the
-selected accounts as TSV. System users, reserved names and bot-password
-holders are never deleted. Take a DB snapshot before any `--delete` run;
-there is no undo.
+selected accounts as TSV. System users, reserved names, bot-password
+holders and accounts blocked on any farm wiki (`block_target.bt_user`) are
+never deleted; the dry run reports the blocked ones as their own count.
+Take a DB snapshot before any `--delete` run; there is no undo.
+
+Run it from `$IP`. Keep the leading `./`: without it, `run.php` looks for
+the path under `$IP/maintenance/` and fails with "Script ... not found".
 
 ```bash
-php maintenance/run.php extensions/WikiRights/KolzchutCustomizations/maintenance/removeNonEditorUsers.php \
+php maintenance/run.php ./extensions/WikiRights/KolzchutCustomizations/maintenance/removeNonEditorUsers.php \
     --wiki=he --keep-grouped --output-file /tmp/candidates.tsv
 ```
 

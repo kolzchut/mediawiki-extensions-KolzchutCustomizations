@@ -47,9 +47,10 @@ require_once "$IP/maintenance/Maintenance.php";
  * script would flag a user who only ever edited another language wiki.
  *
  * This script unions the footprint of every global actor ID across ALL farm
- * wikis (revision, archive, image, oldimage, filearchive, and logging other
- * than the automatic "newusers" entries) and treats a user whose actor has no
- * footprint anywhere as never-edited.
+ * wikis (revision, archive, image, oldimage, filearchive, and every log entry
+ * except the user's own account-creation entry) and treats a user whose actor
+ * has no footprint anywhere as never-edited. Creating ANOTHER account
+ * (newusers/create2 or newusers/byemail) is a footprint: a person acted.
  *
  * Never-edited users are then split into mutually exclusive layers, and the
  * cumulative keep filters choose the deletion tier:
@@ -61,12 +62,21 @@ require_once "$IP/maintenance/Maintenance.php";
  *
  * Some accounts are never deleted whatever the filters: system users (made by
  * User::newSystemUser(), such as "MediaWiki default"), reserved user names,
- * and holders of a bot password, which can use the API without ever editing.
+ * holders of a bot password, which can use the API without ever editing, and
+ * accounts that are the target of a block on any farm wiki (block_target), so
+ * the block keeps its user and the name cannot be re-registered unblocked.
  *
  * The default is a DRY RUN. Nothing is deleted unless --delete is passed, and
  * --delete is refused unless the scan covered every wiki in
  * $wgLocalDatabases. Any farm wiki or table that cannot be read stops the
  * script in either mode, because the result would be wrong.
+ *
+ * Run it from $IP. The "./" prefix matters: without it, run.php looks for the
+ * path under $IP/maintenance/ and reports "Script ... not found".
+ *
+ *   php maintenance/run.php \
+ *       ./extensions/WikiRights/KolzchutCustomizations/maintenance/removeNonEditorUsers.php \
+ *       --wiki=he --keep-grouped --output-file /tmp/candidates.tsv
  */
 class RemoveNonEditorUsers extends Maintenance {
 
@@ -78,6 +88,14 @@ class RemoveNonEditorUsers extends Maintenance {
 		'oldimage' => 'oi_actor',
 		'filearchive' => 'fa_actor',
 	];
+
+	/**
+	 * "newusers" log actions that record the performer creating their OWN
+	 * account. Every account gets one, so they are not a footprint, and they
+	 * are the only log rows deleted with the account. "create2" and "byemail"
+	 * record the performer creating someone else's account: that is activity.
+	 */
+	private const SELF_CREATION_ACTIONS = [ 'create', 'autocreate' ];
 
 	private const LAYER_GROUPED = 'grouped';
 	private const LAYER_WATCHER = 'watcher';
@@ -144,8 +162,12 @@ class RemoveNonEditorUsers extends Maintenance {
 		$grouped = $this->fetchIdSet( $sharedDb, $this->wikis[0], 'user_groups', 'ug_user' );
 		$botPasswordUsers = $this->fetchIdSet( $sharedDb, $this->wikis[0], 'bot_passwords', 'bp_user' );
 		$watchers = [];
+		$blocked = [];
 		foreach ( $this->wikis as $wiki ) {
-			$watchers += $this->fetchIdSet( $this->getWikiDB( $wiki, $delete ), $wiki, 'watchlist', 'wl_user' );
+			$db = $this->getWikiDB( $wiki, $delete );
+			$watchers += $this->fetchIdSet( $db, $wiki, 'watchlist', 'wl_user' );
+			// MW 1.43 block schema: a block on a user account has bt_user set.
+			$blocked += $this->fetchIdSet( $db, $wiki, 'block_target', 'bt_user' );
 		}
 
 		try {
@@ -170,6 +192,7 @@ class RemoveNonEditorUsers extends Maintenance {
 			self::LAYER_CORE => 0,
 		];
 		$protected = 0;
+		$protectedBlocked = 0;
 		$keptTouched = 0;
 		$candidates = [];
 
@@ -185,6 +208,10 @@ class RemoveNonEditorUsers extends Maintenance {
 				|| ( $userNameUtils->isValid( $row->user_name ) && !$userNameUtils->isUsable( $row->user_name ) )
 			) {
 				$protected++;
+				continue;
+			}
+			if ( isset( $blocked[$userId] ) ) {
+				$protectedBlocked++;
 				continue;
 			}
 
@@ -228,7 +255,7 @@ class RemoveNonEditorUsers extends Maintenance {
 			];
 		}
 
-		$this->printReport( $layers, $protected );
+		$this->printReport( $layers, $protected, $protectedBlocked );
 		if ( $touchedCutoff !== null ) {
 			$this->output( "Kept because touched within $touchedDays days: $keptTouched\n" );
 		}
@@ -349,23 +376,76 @@ class RemoveNonEditorUsers extends Maintenance {
 	private function collectActiveActors( bool $primary ): array {
 		$active = [];
 		foreach ( $this->wikis as $wiki ) {
-			$db = $this->getWikiDB( $wiki, $primary );
-			foreach ( self::FOOTPRINT_TABLES as $table => $field ) {
-				$active += $this->fetchIdSet( $db, $wiki, $table, $field );
-			}
-			// Account creation writes a "newusers" entry for every account,
-			// so only other log types count as activity.
-			$active += $this->fetchIdSet( $db, $wiki, 'logging', 'log_actor',
-				[ $db->expr( 'log_type', '!=', 'newusers' ) ] );
+			$active += $this->fetchFootprintActors( $this->getWikiDB( $wiki, $primary ), $wiki );
 		}
 		return $active;
 	}
 
 	/**
+	 * Actor IDs with any footprint on one wiki, optionally limited to some actors.
+	 *
+	 * @param IReadableDatabase $db
+	 * @param string $wiki DB domain
+	 * @param int[]|null $actorIds Only look for these actors; null for all
+	 * @return array<int,true> Set keyed by actor ID
+	 */
+	private function fetchFootprintActors( IReadableDatabase $db, string $wiki, ?array $actorIds = null ): array {
+		$active = [];
+		foreach ( self::FOOTPRINT_TABLES as $table => $field ) {
+			$active += $this->fetchIdSet( $db, $wiki, $table, $field,
+				$actorIds === null ? [] : [ $field => $actorIds ] );
+		}
+		// Account creation writes a "newusers" entry for every account, so
+		// only the user's own creation entry is not activity.
+		$conds = [
+			$db->orExpr( [
+				$db->expr( 'log_type', '!=', 'newusers' ),
+				$db->expr( 'log_action', '!=', self::SELF_CREATION_ACTIONS ),
+			] ),
+		];
+		if ( $actorIds !== null ) {
+			$conds['log_actor'] = $actorIds;
+		}
+		$active += $this->fetchIdSet( $db, $wiki, 'logging', 'log_actor', $conds );
+		return $active;
+	}
+
+	/**
+	 * Re-check one batch on every wiki's primary just before it is deleted:
+	 * a candidate blocked, or with a new footprint, since the scan must stay.
+	 *
+	 * This narrows the window between the scan and the delete to the batch's
+	 * own deletes; it does not lock out a block or edit made during them.
+	 *
+	 * @param array[] $batch
+	 * @return array<int,true> Set of the batch's user IDs to keep
+	 */
+	private function findActedAfterScan( array $batch ): array {
+		$userIds = array_column( $batch, 'user_id' );
+		$actorIds = array_values( array_filter( array_column( $batch, 'actor_id' ) ) );
+		$keep = [];
+		$actedActors = [];
+		foreach ( $this->wikis as $wiki ) {
+			$dbw = $this->getWikiPrimaryDB( $wiki );
+			$keep += $this->fetchIdSet( $dbw, $wiki, 'block_target', 'bt_user', [ 'bt_user' => $userIds ] );
+			if ( $actorIds ) {
+				$actedActors += $this->fetchFootprintActors( $dbw, $wiki, $actorIds );
+			}
+		}
+		foreach ( $batch as $candidate ) {
+			if ( $candidate['actor_id'] !== null && isset( $actedActors[$candidate['actor_id']] ) ) {
+				$keep[$candidate['user_id']] = true;
+			}
+		}
+		return $keep;
+	}
+
+	/**
 	 * @param array<string,int> $layers
 	 * @param int $protected
+	 * @param int $protectedBlocked
 	 */
-	private function printReport( array $layers, int $protected ): void {
+	private function printReport( array $layers, int $protected, int $protectedBlocked ): void {
 		$l1 = $layers[self::LAYER_GROUPED];
 		$l2 = $layers[self::LAYER_WATCHER];
 		$l3 = $layers[self::LAYER_EMAIL];
@@ -373,6 +453,7 @@ class RemoveNonEditorUsers extends Maintenance {
 		$lines = [
 			"\n=== Never-edited users, farm-wide (layers are mutually exclusive) ===",
 			sprintf( '  protected, never deleted        : %6d  (system user, reserved, bot password)', $protected ),
+			sprintf( '  protected, blocked account      : %6d  (block_target on any farm wiki)', $protectedBlocked ),
 			sprintf( '  L1 holds a user group           : %6d', $l1 ),
 			sprintf( '  L2 no group, watches a page     : %6d', $l2 ),
 			sprintf( '  L3 no group or watch, email conf: %6d', $l3 ),
@@ -413,16 +494,28 @@ class RemoveNonEditorUsers extends Maintenance {
 	/**
 	 * Delete the selected accounts, one batch at a time.
 	 *
-	 * Per-wiki rows go first and the shared user rows last, so an interrupted
-	 * run leaves users that a re-run selects and finishes, never per-wiki rows
-	 * that point at a deleted user.
+	 * Each batch is re-checked first, and a candidate blocked or active since
+	 * the scan is kept. Per-wiki rows go next and the shared user rows last, so
+	 * an interrupted run leaves users that a re-run selects and finishes, never
+	 * per-wiki rows that point at a deleted user.
 	 *
 	 * @param array[] $candidates
 	 */
 	private function deleteCandidates( array $candidates ): void {
 		$this->output( 'Deleting ' . count( $candidates ) . " account(s)...\n" );
 		$done = 0;
+		$keptAfterScan = 0;
 		foreach ( array_chunk( $candidates, $this->getBatchSize() ) as $batch ) {
+			$acted = $this->findActedAfterScan( $batch );
+			if ( $acted ) {
+				$keptAfterScan += count( $acted );
+				$batch = array_values( array_filter( $batch,
+					static fn ( $candidate ) => !isset( $acted[$candidate['user_id']] ) ) );
+				if ( !$batch ) {
+					continue;
+				}
+			}
+
 			$userIds = array_column( $batch, 'user_id' );
 			$actorIds = array_values( array_filter( array_column( $batch, 'actor_id' ) ) );
 
@@ -471,15 +564,18 @@ class RemoveNonEditorUsers extends Maintenance {
 				->where( [ 'ss_row_id' => 1 ] )
 				->caller( __METHOD__ )->execute();
 		}
+		$this->output( "Deleted: $done\n" );
+		$this->output( "Kept because they were blocked or acted after the scan: $keptAfterScan\n" );
 		$this->output( "done.\n" );
 	}
 
 	/**
 	 * Delete one batch's rows from the tables a wiki keeps for itself.
 	 *
-	 * Only the automatic "newusers" log entries are removed: any other entry
-	 * would have made the user active, so finding one here means the user
-	 * acted after the scan, and its log must stay.
+	 * Only the user's own account-creation log entries (SELF_CREATION_ACTIONS)
+	 * are removed: any other entry, including a "create2"/"byemail" entry for
+	 * an account the user created, would have made the user active, so finding
+	 * one here means the user acted after the scan, and its log must stay.
 	 *
 	 * @param IDatabase $dbw
 	 * @param int[] $userIds
@@ -489,10 +585,18 @@ class RemoveNonEditorUsers extends Maintenance {
 		$this->beginTransaction( $dbw, __METHOD__ );
 		if ( $actorIds ) {
 			$dbw->newDeleteQueryBuilder()->deleteFrom( 'logging' )
-				->where( [ 'log_actor' => $actorIds, 'log_type' => 'newusers' ] )
+				->where( [
+					'log_actor' => $actorIds,
+					'log_type' => 'newusers',
+					'log_action' => self::SELF_CREATION_ACTIONS,
+				] )
 				->caller( __METHOD__ )->execute();
 			$dbw->newDeleteQueryBuilder()->deleteFrom( 'recentchanges' )
-				->where( [ 'rc_actor' => $actorIds, 'rc_log_type' => 'newusers' ] )
+				->where( [
+					'rc_actor' => $actorIds,
+					'rc_log_type' => 'newusers',
+					'rc_log_action' => self::SELF_CREATION_ACTIONS,
+				] )
 				->caller( __METHOD__ )->execute();
 		}
 		$watchIds = $dbw->newSelectQueryBuilder()
