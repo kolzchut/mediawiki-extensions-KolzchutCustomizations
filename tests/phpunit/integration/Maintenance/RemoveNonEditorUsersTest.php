@@ -10,6 +10,7 @@ use MediaWiki\User\User;
 use MediaWiki\User\UserIdentity;
 use Wikimedia\Rdbms\DatabaseDomain;
 use Wikimedia\Rdbms\IDatabase;
+use Wikimedia\TestingAccessWrapper;
 
 require_once __DIR__ . '/../../../../maintenance/removeNonEditorUsers.php';
 
@@ -138,6 +139,36 @@ class RemoveNonEditorUsersTest extends MaintenanceBaseTestCase {
 				'log_actor' => $this->actorId( $performer ),
 			] )
 			->caller( __METHOD__ )->fetchField();
+	}
+
+	/**
+	 * Swap in a script that runs $hook once the scan is over, as the delete
+	 * phase starts: what a block or an edit made during a --delete run does.
+	 *
+	 * @param callable $hook
+	 */
+	private function actBetweenScanAndDelete( callable $hook ): void {
+		$this->maintenance = TestingAccessWrapper::newFromObject(
+			new class( $hook ) extends RemoveNonEditorUsers {
+				/** @var callable|null */
+				private $hook;
+
+				public function __construct( callable $hook ) {
+					parent::__construct();
+					$this->hook = $hook;
+				}
+
+				/** @inheritDoc */
+				protected function output( $out, $channel = null ) {
+					if ( $this->hook && str_starts_with( $out, 'Deleting ' ) ) {
+						$hook = $this->hook;
+						$this->hook = null;
+						$hook();
+					}
+					parent::output( $out, $channel );
+				}
+			}
+		);
 	}
 
 	/**
@@ -288,6 +319,41 @@ class RemoveNonEditorUsersTest extends MaintenanceBaseTestCase {
 		$this->assertFalse( $this->userExists( $neverEdited ) );
 
 		$this->assertTrue( $this->userExists( $blocked ) );
+	}
+
+	public function testUserBlockedAfterTheScanIsNotDeleted() {
+		$blockedLater = $this->newUser();
+		$neverEdited = $this->newUser();
+		$this->actBetweenScanAndDelete( function () use ( $blockedLater ) {
+			$this->addBlockTarget( $this->otherDb(), $blockedLater );
+		} );
+
+		$selected = $this->runScript( [ 'keep-grouped' => true, 'delete' => true ] );
+
+		$this->assertContains( $blockedLater->getName(), $selected, 'the scan selected the user' );
+		$this->assertTrue( $this->userExists( $blockedLater ) );
+		$this->assertFalse( $this->userExists( $neverEdited ) );
+		$this->expectOutputRegex( '/Kept because they were blocked or acted after the scan: 1\n/' );
+	}
+
+	public function testUserWhoEditsAfterTheScanIsNotDeleted() {
+		$editsLater = $this->newUser();
+		$createsLater = $this->newUser();
+		$neverEdited = $this->newUser();
+		$this->actBetweenScanAndDelete( function () use ( $editsLater, $createsLater ) {
+			$this->addRevision( $this->otherDb(), $editsLater );
+			$this->addNewUsersLog( $this->getDb(), $createsLater, 'create2', 'Someone else' );
+		} );
+
+		$selected = $this->runScript( [ 'keep-grouped' => true, 'delete' => true ] );
+
+		$this->assertContains( $editsLater->getName(), $selected, 'the scan selected the user' );
+		$this->assertContains( $createsLater->getName(), $selected, 'the scan selected the user' );
+		$this->assertTrue( $this->userExists( $editsLater ) );
+		$this->assertTrue( $this->userExists( $createsLater ) );
+		$this->assertSame( 1, $this->countNewUsersLog( $this->getDb(), $createsLater, 'create2' ) );
+		$this->assertFalse( $this->userExists( $neverEdited ) );
+		$this->expectOutputRegex( '/Kept because they were blocked or acted after the scan: 2\n/' );
 	}
 
 	public function testUnreadableBlockTargetIsFatal() {

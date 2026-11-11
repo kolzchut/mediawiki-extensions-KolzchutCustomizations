@@ -376,20 +376,68 @@ class RemoveNonEditorUsers extends Maintenance {
 	private function collectActiveActors( bool $primary ): array {
 		$active = [];
 		foreach ( $this->wikis as $wiki ) {
-			$db = $this->getWikiDB( $wiki, $primary );
-			foreach ( self::FOOTPRINT_TABLES as $table => $field ) {
-				$active += $this->fetchIdSet( $db, $wiki, $table, $field );
-			}
-			// Account creation writes a "newusers" entry for every account, so
-			// only the user's own creation entry is not activity.
-			$active += $this->fetchIdSet( $db, $wiki, 'logging', 'log_actor', [
-				$db->orExpr( [
-					$db->expr( 'log_type', '!=', 'newusers' ),
-					$db->expr( 'log_action', '!=', self::SELF_CREATION_ACTIONS ),
-				] ),
-			] );
+			$active += $this->fetchFootprintActors( $this->getWikiDB( $wiki, $primary ), $wiki );
 		}
 		return $active;
+	}
+
+	/**
+	 * Actor IDs with any footprint on one wiki, optionally limited to some actors.
+	 *
+	 * @param IReadableDatabase $db
+	 * @param string $wiki DB domain
+	 * @param int[]|null $actorIds Only look for these actors; null for all
+	 * @return array<int,true> Set keyed by actor ID
+	 */
+	private function fetchFootprintActors( IReadableDatabase $db, string $wiki, ?array $actorIds = null ): array {
+		$active = [];
+		foreach ( self::FOOTPRINT_TABLES as $table => $field ) {
+			$active += $this->fetchIdSet( $db, $wiki, $table, $field,
+				$actorIds === null ? [] : [ $field => $actorIds ] );
+		}
+		// Account creation writes a "newusers" entry for every account, so
+		// only the user's own creation entry is not activity.
+		$conds = [
+			$db->orExpr( [
+				$db->expr( 'log_type', '!=', 'newusers' ),
+				$db->expr( 'log_action', '!=', self::SELF_CREATION_ACTIONS ),
+			] ),
+		];
+		if ( $actorIds !== null ) {
+			$conds['log_actor'] = $actorIds;
+		}
+		$active += $this->fetchIdSet( $db, $wiki, 'logging', 'log_actor', $conds );
+		return $active;
+	}
+
+	/**
+	 * Re-check one batch on every wiki's primary just before it is deleted:
+	 * a candidate blocked, or with a new footprint, since the scan must stay.
+	 *
+	 * This narrows the window between the scan and the delete to the batch's
+	 * own deletes; it does not lock out a block or edit made during them.
+	 *
+	 * @param array[] $batch
+	 * @return array<int,true> Set of the batch's user IDs to keep
+	 */
+	private function findActedAfterScan( array $batch ): array {
+		$userIds = array_column( $batch, 'user_id' );
+		$actorIds = array_values( array_filter( array_column( $batch, 'actor_id' ) ) );
+		$keep = [];
+		$actedActors = [];
+		foreach ( $this->wikis as $wiki ) {
+			$dbw = $this->getWikiPrimaryDB( $wiki );
+			$keep += $this->fetchIdSet( $dbw, $wiki, 'block_target', 'bt_user', [ 'bt_user' => $userIds ] );
+			if ( $actorIds ) {
+				$actedActors += $this->fetchFootprintActors( $dbw, $wiki, $actorIds );
+			}
+		}
+		foreach ( $batch as $candidate ) {
+			if ( $candidate['actor_id'] !== null && isset( $actedActors[$candidate['actor_id']] ) ) {
+				$keep[$candidate['user_id']] = true;
+			}
+		}
+		return $keep;
 	}
 
 	/**
@@ -446,16 +494,28 @@ class RemoveNonEditorUsers extends Maintenance {
 	/**
 	 * Delete the selected accounts, one batch at a time.
 	 *
-	 * Per-wiki rows go first and the shared user rows last, so an interrupted
-	 * run leaves users that a re-run selects and finishes, never per-wiki rows
-	 * that point at a deleted user.
+	 * Each batch is re-checked first, and a candidate blocked or active since
+	 * the scan is kept. Per-wiki rows go next and the shared user rows last, so
+	 * an interrupted run leaves users that a re-run selects and finishes, never
+	 * per-wiki rows that point at a deleted user.
 	 *
 	 * @param array[] $candidates
 	 */
 	private function deleteCandidates( array $candidates ): void {
 		$this->output( 'Deleting ' . count( $candidates ) . " account(s)...\n" );
 		$done = 0;
+		$keptAfterScan = 0;
 		foreach ( array_chunk( $candidates, $this->getBatchSize() ) as $batch ) {
+			$acted = $this->findActedAfterScan( $batch );
+			if ( $acted ) {
+				$keptAfterScan += count( $acted );
+				$batch = array_values( array_filter( $batch,
+					static fn ( $candidate ) => !isset( $acted[$candidate['user_id']] ) ) );
+				if ( !$batch ) {
+					continue;
+				}
+			}
+
 			$userIds = array_column( $batch, 'user_id' );
 			$actorIds = array_values( array_filter( array_column( $batch, 'actor_id' ) ) );
 
@@ -504,6 +564,8 @@ class RemoveNonEditorUsers extends Maintenance {
 				->where( [ 'ss_row_id' => 1 ] )
 				->caller( __METHOD__ )->execute();
 		}
+		$this->output( "Deleted: $done\n" );
+		$this->output( "Kept because they were blocked or acted after the scan: $keptAfterScan\n" );
 		$this->output( "done.\n" );
 	}
 
