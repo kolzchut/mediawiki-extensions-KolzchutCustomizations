@@ -55,6 +55,15 @@ read. Keep filters are cumulative: `--keep-grouped`, `--keep-watchers`,
 selected accounts as TSV. System users, reserved names, bot-password
 holders and accounts blocked on any farm wiki (`block_target.bt_user`) are
 never deleted; the dry run reports the blocked ones as their own count.
+Two more protections apply whatever the filters (kolzchut/mediawiki-extensions-KolzchutCustomizations#5):
+an account with `user_editcount > 0` is kept even when none of its edits
+survive, and so is an **active watcher**: an account that, on any farm wiki,
+watches a page whose latest revision is within `--active-watcher-days N`
+days (default 365) and whose `wl_notificationtimestamp` for it is either
+within that window (a change was flagged to it) or NULL (it has seen the
+change). The dry run prints each of these on its own line, and the TSV
+carries `editcount` and `active_watcher` columns, which are 0 on every
+selected account.
 Take a DB snapshot before any `--delete` run; there is no undo.
 
 Run it from `$IP`. Keep the leading `./`: without it, `run.php` looks for

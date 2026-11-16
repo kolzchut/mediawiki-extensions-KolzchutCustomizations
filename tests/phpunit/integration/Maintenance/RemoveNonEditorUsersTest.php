@@ -11,6 +11,7 @@ use MediaWiki\User\UserIdentity;
 use Wikimedia\Rdbms\DatabaseDomain;
 use Wikimedia\Rdbms\IDatabase;
 use Wikimedia\TestingAccessWrapper;
+use Wikimedia\Timestamp\ConvertibleTimestamp;
 
 require_once __DIR__ . '/../../../../maintenance/removeNonEditorUsers.php';
 
@@ -28,7 +29,7 @@ class RemoveNonEditorUsersTest extends MaintenanceBaseTestCase {
 
 	/** Per-wiki tables the script reads or writes on every farm wiki. */
 	private const PER_WIKI_TABLES = [
-		'revision', 'archive', 'image', 'oldimage', 'filearchive', 'logging',
+		'page', 'revision', 'archive', 'image', 'oldimage', 'filearchive', 'logging',
 		'recentchanges', 'watchlist', 'watchlist_expiry', 'user_properties',
 		'user_former_groups', 'user_newtalk', 'block', 'block_target', 'site_stats',
 	];
@@ -58,6 +59,14 @@ class RemoveNonEditorUsersTest extends MaintenanceBaseTestCase {
 		$this->overrideConfigValue(
 			MainConfigNames::LocalDatabases, [ $this->currentWiki, $this->otherWiki ]
 		);
+	}
+
+	protected function tearDown(): void {
+		// The other wiki's connection shares the test's handle and switches its
+		// domain. Switch it back, or the core reset reads the changed-table list
+		// of the other domain and leaves this test's rows for the next test.
+		$this->getDb()->newSelectQueryBuilder()->select( '1' )->caller( __METHOD__ )->fetchField();
+		parent::tearDown();
 	}
 
 	private function otherDb(): IDatabase {
@@ -98,6 +107,81 @@ class RemoveNonEditorUsersTest extends MaintenanceBaseTestCase {
 				'wl_title' => 'Watched_page',
 				'wl_notificationtimestamp' => null,
 			] )
+			->caller( __METHOD__ )->execute();
+	}
+
+	/**
+	 * Create a page whose latest revision is $daysAgo days old, made by an
+	 * editor of its own, and return its title.
+	 *
+	 * @param IDatabase $db
+	 * @param int $daysAgo
+	 * @return string
+	 */
+	private function addPageChanged( IDatabase $db, int $daysAgo ): string {
+		static $n = 0;
+		$title = 'Kzc_watched_page_' . ( ++$n );
+		$timestamp = $db->timestamp( ConvertibleTimestamp::time() - $daysAgo * 86400 );
+		$db->newInsertQueryBuilder()->insertInto( 'page' )
+			->row( [
+				'page_namespace' => NS_MAIN,
+				'page_title' => $title,
+				'page_is_redirect' => 0,
+				'page_is_new' => 0,
+				'page_random' => 0.5,
+				'page_touched' => $timestamp,
+				'page_latest' => 0,
+				'page_len' => 0,
+			] )
+			->caller( __METHOD__ )->execute();
+		$pageId = $db->insertId();
+		$db->newInsertQueryBuilder()->insertInto( 'revision' )
+			->row( [
+				'rev_page' => $pageId,
+				'rev_comment_id' => 0,
+				'rev_actor' => $this->actorId( $this->newUser() ),
+				'rev_timestamp' => $timestamp,
+				'rev_minor_edit' => 0,
+				'rev_deleted' => 0,
+				'rev_len' => 0,
+				'rev_parent_id' => 0,
+				'rev_sha1' => '',
+			] )
+			->caller( __METHOD__ )->execute();
+		$db->newUpdateQueryBuilder()->update( 'page' )
+			->set( [ 'page_latest' => $db->insertId() ] )
+			->where( [ 'page_id' => $pageId ] )
+			->caller( __METHOD__ )->execute();
+		return $title;
+	}
+
+	/**
+	 * Watch $title, with the unseen-change marker set $notifiedDaysAgo days
+	 * ago, or NULL (seen since the last change) when it is null.
+	 *
+	 * @param IDatabase $db
+	 * @param UserIdentity $user
+	 * @param string $title
+	 * @param int|null $notifiedDaysAgo
+	 */
+	private function addWatchOf(
+		IDatabase $db, UserIdentity $user, string $title, ?int $notifiedDaysAgo
+	): void {
+		$db->newInsertQueryBuilder()->insertInto( 'watchlist' )
+			->row( [
+				'wl_user' => $user->getId(),
+				'wl_namespace' => NS_MAIN,
+				'wl_title' => $title,
+				'wl_notificationtimestamp' => $notifiedDaysAgo === null ? null
+					: $db->timestamp( ConvertibleTimestamp::time() - $notifiedDaysAgo * 86400 ),
+			] )
+			->caller( __METHOD__ )->execute();
+	}
+
+	private function setEditCount( UserIdentity $user, int $count ): void {
+		$this->getDb()->newUpdateQueryBuilder()->update( 'user' )
+			->set( [ 'user_editcount' => $count ] )
+			->where( [ 'user_id' => $user->getId() ] )
 			->caller( __METHOD__ )->execute();
 	}
 
@@ -459,5 +543,199 @@ class RemoveNonEditorUsersTest extends MaintenanceBaseTestCase {
 			->select( 'COUNT(*)' )->from( 'watchlist' )
 			->where( [ 'wl_user' => $neverEdited->getId() ] )
 			->caller( __METHOD__ )->fetchField() );
+	}
+
+	/** Every tier the script offers, from no keep filter to all of them. */
+	private const TIERS = [
+		'T1' => [],
+		'T2' => [ 'keep-grouped' => true ],
+		'T3' => [ 'keep-grouped' => true, 'keep-watchers' => true ],
+		'T4' => [ 'keep-grouped' => true, 'keep-watchers' => true, 'keep-email-confirmed' => true ],
+	];
+
+	public function testAccountWithAnEditCountIsNeverSelectedUnderAnyTier() {
+		$counted = $this->newUser();
+		$this->setEditCount( $counted, 1312 );
+		$neverEdited = $this->newUser();
+
+		foreach ( self::TIERS as $tier => $options ) {
+			$this->maintenance = $this->createMaintenance();
+			$selected = $this->runScript( $options );
+			$this->assertNotContains( $counted->getName(), $selected,
+				"$tier: an edit count with no surviving footprint must keep the user" );
+			$this->assertContains( $neverEdited->getName(), $selected, "$tier: control is selected" );
+		}
+		$this->expectOutputRegex(
+			'/protected, has an edit count\s*:\s*1\s+\(user_editcount > 0, 1312 edits in total\)/'
+		);
+	}
+
+	public function testAccountWithAnEditCountSurvivesDelete() {
+		$counted = $this->newUser();
+		$this->setEditCount( $counted, 3 );
+		$neverEdited = $this->newUser();
+
+		$selected = $this->runScript( [ 'delete' => true ] );
+
+		$this->assertNotContains( $counted->getName(), $selected );
+		$this->assertTrue( $this->userExists( $counted ) );
+		$this->assertFalse( $this->userExists( $neverEdited ) );
+	}
+
+	public function testUserWhoseEditCountRisesAfterTheScanIsNotDeleted() {
+		$countsLater = $this->newUser();
+		$neverEdited = $this->newUser();
+		$this->actBetweenScanAndDelete( function () use ( $countsLater ) {
+			$this->setEditCount( $countsLater, 1 );
+		} );
+
+		$selected = $this->runScript( [ 'delete' => true ] );
+
+		$this->assertContains( $countsLater->getName(), $selected, 'the scan selected the user' );
+		$this->assertTrue( $this->userExists( $countsLater ) );
+		$this->assertFalse( $this->userExists( $neverEdited ) );
+		$this->expectOutputRegex( '/Kept because they were blocked or acted after the scan: 1\n/' );
+	}
+
+	public function testActiveWatcherIsNeverSelected() {
+		$recentPage = $this->addPageChanged( $this->getDb(), 10 );
+		$recentElsewhere = $this->addPageChanged( $this->otherDb(), 10 );
+		// Rule 1: the latest change was flagged to it within the window.
+		$flagged = $this->newUser();
+		$this->addWatchOf( $this->getDb(), $flagged, $recentPage, 10 );
+		// Rule 2: it viewed the page after that change.
+		$seen = $this->newUser();
+		$this->addWatchOf( $this->getDb(), $seen, $recentPage, null );
+		// Either rule counts on any farm wiki.
+		$flaggedElsewhere = $this->newUser();
+		$this->addWatchOf( $this->otherDb(), $flaggedElsewhere, $recentElsewhere, 10 );
+		$seenElsewhere = $this->newUser();
+		$this->addWatchOf( $this->otherDb(), $seenElsewhere, $recentElsewhere, null );
+		$active = [ $flagged, $seen, $flaggedElsewhere, $seenElsewhere ];
+
+		foreach ( self::TIERS as $tier => $options ) {
+			$this->maintenance = $this->createMaintenance();
+			$selected = $this->runScript( $options );
+			foreach ( $active as $user ) {
+				$this->assertNotContains( $user->getName(), $selected,
+					"$tier: an active watcher must never be selected" );
+			}
+		}
+		$this->expectOutputRegex( '/protected, active watcher\s*:\s*4\s+\(watched page changed within 365 days/' );
+	}
+
+	public function testStaleWatcherIsStillSelected() {
+		// Its watched pages last changed before the window.
+		$oldPage = $this->addPageChanged( $this->getDb(), 400 );
+		$oldElsewhere = $this->addPageChanged( $this->otherDb(), 400 );
+		$staleSeen = $this->newUser();
+		$this->addWatchOf( $this->getDb(), $staleSeen, $oldPage, null );
+		$staleFlagged = $this->newUser();
+		$this->addWatchOf( $this->otherDb(), $staleFlagged, $oldElsewhere, 400 );
+		// The page changed within the window, but the change flagged to it
+		// is older: it has not looked in over a year.
+		$recentPage = $this->addPageChanged( $this->getDb(), 10 );
+		$neverLooked = $this->newUser();
+		$this->addWatchOf( $this->getDb(), $neverLooked, $recentPage, 500 );
+
+		$selected = $this->runScript();
+
+		$this->assertContains( $staleSeen->getName(), $selected );
+		$this->assertContains( $staleFlagged->getName(), $selected );
+		$this->assertContains( $neverLooked->getName(), $selected );
+		$this->assertNotContains( $staleSeen->getName(), $this->runScript( [ 'keep-watchers' => true ] ),
+			'--keep-watchers still keeps every watcher' );
+		$this->expectOutputRegex( '/protected, active watcher\s*:\s*0\s/' );
+	}
+
+	public function testActiveWatcherDaysSetsTheWindow() {
+		$page100 = $this->addPageChanged( $this->otherDb(), 100 );
+		$page400 = $this->addPageChanged( $this->otherDb(), 400 );
+		$watches100 = $this->newUser();
+		$this->addWatchOf( $this->otherDb(), $watches100, $page100, null );
+		$flagged100 = $this->newUser();
+		$this->addWatchOf( $this->otherDb(), $flagged100, $page100, 100 );
+		$watches400 = $this->newUser();
+		$this->addWatchOf( $this->otherDb(), $watches400, $page400, null );
+
+		$selected = $this->runScript();
+		$this->assertNotContains( $watches100->getName(), $selected, 'default 365 keeps a 100-day change' );
+		$this->assertNotContains( $flagged100->getName(), $selected );
+		$this->assertContains( $watches400->getName(), $selected );
+
+		$this->maintenance = $this->createMaintenance();
+		$selected = $this->runScript( [ 'active-watcher-days' => '30' ] );
+		$this->assertContains( $watches100->getName(), $selected, '30 days: a 100-day change is stale' );
+		$this->assertContains( $flagged100->getName(), $selected );
+		$this->assertContains( $watches400->getName(), $selected );
+
+		$this->maintenance = $this->createMaintenance();
+		$selected = $this->runScript( [ 'active-watcher-days' => '500' ] );
+		$this->assertNotContains( $watches100->getName(), $selected );
+		$this->assertNotContains( $watches400->getName(), $selected, '500 days: a 400-day change is recent' );
+		$this->expectOutputRegex( '/watched page changed within 30 days.*watched page changed within 500 days/s' );
+	}
+
+	public function testActiveWatcherDaysMustBePositive() {
+		foreach ( [ '0', '-1', 'abc' ] as $value ) {
+			$this->maintenance = $this->createMaintenance();
+			try {
+				$this->runScript( [ 'active-watcher-days' => $value ] );
+				$this->fail( "expected --active-watcher-days $value to be refused" );
+			} catch ( MaintenanceFatalError $e ) {
+				// expected
+			}
+		}
+		$this->expectOutputRegex( "/--active-watcher-days takes a positive whole number of days, got 'abc'/" );
+	}
+
+	public function testActiveWatcherSurvivesDelete() {
+		$recentPage = $this->addPageChanged( $this->otherDb(), 10 );
+		$active = $this->newUser();
+		$this->addWatchOf( $this->otherDb(), $active, $recentPage, null );
+		$neverEdited = $this->newUser();
+
+		$this->runScript( [ 'delete' => true ] );
+
+		$this->assertTrue( $this->userExists( $active ) );
+		$this->assertSame( 1, (int)$this->otherDb()->newSelectQueryBuilder()
+			->select( 'COUNT(*)' )->from( 'watchlist' )
+			->where( [ 'wl_user' => $active->getId() ] )
+			->caller( __METHOD__ )->fetchField() );
+		$this->assertFalse( $this->userExists( $neverEdited ) );
+	}
+
+	public function testUserWhoBecomesAnActiveWatcherAfterTheScanIsNotDeleted() {
+		$recentPage = $this->addPageChanged( $this->otherDb(), 10 );
+		$watchesLater = $this->newUser();
+		$neverEdited = $this->newUser();
+		$this->actBetweenScanAndDelete( function () use ( $watchesLater, $recentPage ) {
+			$this->addWatchOf( $this->otherDb(), $watchesLater, $recentPage, 1 );
+		} );
+
+		$selected = $this->runScript( [ 'delete' => true ] );
+
+		$this->assertContains( $watchesLater->getName(), $selected, 'the scan selected the user' );
+		$this->assertTrue( $this->userExists( $watchesLater ) );
+		$this->assertFalse( $this->userExists( $neverEdited ) );
+		$this->expectOutputRegex( '/Kept because they were blocked or acted after the scan: 1\n/' );
+	}
+
+	public function testCandidateFileCarriesBothProtectionColumns() {
+		$neverEdited = $this->newUser();
+		$file = $this->getNewTempFile();
+		$this->maintenance->setOption( 'output-file', $file );
+		$this->maintenance->execute();
+
+		$lines = file( $file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES );
+		$header = explode( "\t", $lines[0] );
+		$this->assertContains( 'editcount', $header );
+		$this->assertContains( 'active_watcher', $header );
+		foreach ( array_slice( $lines, 1 ) as $line ) {
+			$row = array_combine( $header, explode( "\t", $line ) );
+			$this->assertSame( '0', $row['editcount'] );
+			$this->assertSame( '0', $row['active_watcher'] );
+		}
+		$this->assertStringContainsString( $neverEdited->getName(), implode( "\n", $lines ) );
 	}
 }

@@ -66,6 +66,19 @@ require_once "$IP/maintenance/Maintenance.php";
  * accounts that are the target of a block on any farm wiki (block_target), so
  * the block keeps its user and the name cannot be re-registered unblocked.
  *
+ * Two more protections follow the 2026-11-16 decision on kolzchut/kz#485
+ * (kolzchut/mediawiki-extensions-KolzchutCustomizations#5): delete no account
+ * that has an edit count, or that is actively watching.
+ *
+ *  - An account whose user_editcount is above zero is kept even when none of
+ *    its edits survive in the tables above. Those counts are real edits that
+ *    left no row we can find, so the person is a contributor.
+ *  - An active watcher is kept. That is an account that, on any farm wiki,
+ *    watches a page whose latest revision is within --active-watcher-days
+ *    (default 365) days, and whose wl_notificationtimestamp for that page is
+ *    either within the same window (a change was flagged to it, and an email
+ *    may have gone out) or NULL (it viewed the page after that change).
+ *
  * The default is a DRY RUN. Nothing is deleted unless --delete is passed, and
  * --delete is refused unless the scan covered every wiki in
  * $wgLocalDatabases. Any farm wiki or table that cannot be read stops the
@@ -102,6 +115,14 @@ class RemoveNonEditorUsers extends Maintenance {
 	private const LAYER_EMAIL = 'email';
 	private const LAYER_CORE = 'core';
 
+	/** Default window, in days, for the active-watcher protection. */
+	private const DEFAULT_ACTIVE_WATCHER_DAYS = 365;
+
+	private const PROTECTED_SYSTEM = 'system';
+	private const PROTECTED_BLOCKED = 'blocked';
+	private const PROTECTED_EDIT_COUNT = 'editcount';
+	private const PROTECTED_ACTIVE_WATCHER = 'watcher';
+
 	/** @var string[] DB domains of the wikis scanned, the current wiki first. */
 	private array $wikis = [];
 
@@ -110,6 +131,12 @@ class RemoveNonEditorUsers extends Maintenance {
 
 	/** @var bool Whether the scan is known to cover the whole farm. */
 	private bool $farmComplete = false;
+
+	/** @var int Days in the active-watcher window. */
+	private int $activeWatcherDays = self::DEFAULT_ACTIVE_WATCHER_DAYS;
+
+	/** @var int Unix time the active-watcher window starts at. */
+	private int $activeWatcherCutoff = 0;
 
 	public function __construct() {
 		parent::__construct();
@@ -127,6 +154,11 @@ class RemoveNonEditorUsers extends Maintenance {
 		$this->addOption( 'keep-email-confirmed', 'Do not delete users with a confirmed email address' );
 		$this->addOption( 'ignore-touched',
 			'Do not delete accounts touched within the last N days', false, true );
+		$this->addOption( 'active-watcher-days',
+			'Window, in days, for the always-on active-watcher protection: an account that watches a page '
+			. 'changed within N days, and was flagged that change within N days or has seen it, is never '
+			. 'deleted. Default ' . self::DEFAULT_ACTIVE_WATCHER_DAYS . '.',
+			false, true );
 		$this->addOption( 'output-file',
 			'Write the selected accounts as TSV to this path', false, true );
 		$this->setBatchSize( 500 );
@@ -137,6 +169,8 @@ class RemoveNonEditorUsers extends Maintenance {
 	public function execute() {
 		$delete = $this->hasOption( 'delete' );
 		$touchedDays = $this->getTouchedDays();
+		$this->activeWatcherDays = $this->getActiveWatcherDays();
+		$this->activeWatcherCutoff = ConvertibleTimestamp::time() - $this->activeWatcherDays * 86400;
 		if ( $this->getBatchSize() < 1 ) {
 			$this->fatalError( 'Refusing to run: --batch-size must be a positive integer.' );
 		}
@@ -162,10 +196,12 @@ class RemoveNonEditorUsers extends Maintenance {
 		$grouped = $this->fetchIdSet( $sharedDb, $this->wikis[0], 'user_groups', 'ug_user' );
 		$botPasswordUsers = $this->fetchIdSet( $sharedDb, $this->wikis[0], 'bot_passwords', 'bp_user' );
 		$watchers = [];
+		$activeWatchers = [];
 		$blocked = [];
 		foreach ( $this->wikis as $wiki ) {
 			$db = $this->getWikiDB( $wiki, $delete );
 			$watchers += $this->fetchIdSet( $db, $wiki, 'watchlist', 'wl_user' );
+			$activeWatchers += $this->fetchActiveWatchers( $db, $wiki );
 			// MW 1.43 block schema: a block on a user account has bt_user set.
 			$blocked += $this->fetchIdSet( $db, $wiki, 'block_target', 'bt_user' );
 		}
@@ -174,7 +210,7 @@ class RemoveNonEditorUsers extends Maintenance {
 			$rows = $sharedDb->newSelectQueryBuilder()
 				->select( [
 					'user_id', 'user_name', 'user_touched', 'user_registration',
-					'user_email_authenticated', 'user_token', 'actor_id',
+					'user_email_authenticated', 'user_token', 'user_editcount', 'actor_id',
 				] )
 				->from( 'user' )
 				->leftJoin( 'actor', null, 'user_id = actor_user' )
@@ -191,8 +227,13 @@ class RemoveNonEditorUsers extends Maintenance {
 			self::LAYER_EMAIL => 0,
 			self::LAYER_CORE => 0,
 		];
-		$protected = 0;
-		$protectedBlocked = 0;
+		$protected = [
+			self::PROTECTED_SYSTEM => 0,
+			self::PROTECTED_BLOCKED => 0,
+			self::PROTECTED_EDIT_COUNT => 0,
+			self::PROTECTED_ACTIVE_WATCHER => 0,
+		];
+		$protectedEdits = 0;
 		$keptTouched = 0;
 		$candidates = [];
 
@@ -207,11 +248,23 @@ class RemoveNonEditorUsers extends Maintenance {
 				|| rtrim( $row->user_token, " \0" ) === User::INVALID_TOKEN
 				|| ( $userNameUtils->isValid( $row->user_name ) && !$userNameUtils->isUsable( $row->user_name ) )
 			) {
-				$protected++;
+				$protected[self::PROTECTED_SYSTEM]++;
 				continue;
 			}
 			if ( isset( $blocked[$userId] ) ) {
-				$protectedBlocked++;
+				$protected[self::PROTECTED_BLOCKED]++;
+				continue;
+			}
+			// An edit count with no surviving footprint still means a person
+			// edited somewhere: never delete them.
+			$editCount = (int)$row->user_editcount;
+			if ( $editCount > 0 ) {
+				$protected[self::PROTECTED_EDIT_COUNT]++;
+				$protectedEdits += $editCount;
+				continue;
+			}
+			if ( isset( $activeWatchers[$userId] ) ) {
+				$protected[self::PROTECTED_ACTIVE_WATCHER]++;
 				continue;
 			}
 
@@ -252,10 +305,14 @@ class RemoveNonEditorUsers extends Maintenance {
 				'has_group' => (int)$hasGroup,
 				'is_watcher' => (int)$isWatcher,
 				'email_confirmed' => (int)$emailConfirmed,
+				// Always 0 here: both columns are in the file so a reader can
+				// check the two protections against the selected accounts.
+				'editcount' => $editCount,
+				'active_watcher' => (int)isset( $activeWatchers[$userId] ),
 			];
 		}
 
-		$this->printReport( $layers, $protected, $protectedBlocked );
+		$this->printReport( $layers, $protected, $protectedEdits );
 		if ( $touchedCutoff !== null ) {
 			$this->output( "Kept because touched within $touchedDays days: $keptTouched\n" );
 		}
@@ -287,6 +344,21 @@ class RemoveNonEditorUsers extends Maintenance {
 		$days = (string)$this->getOption( 'ignore-touched' );
 		if ( !ctype_digit( $days ) ) {
 			$this->fatalError( "--ignore-touched takes a non-negative whole number of days, got '$days'." );
+		}
+		return (int)$days;
+	}
+
+	/**
+	 * @return int Days from --active-watcher-days, or the default
+	 */
+	private function getActiveWatcherDays(): int {
+		if ( !$this->hasOption( 'active-watcher-days' ) ) {
+			return self::DEFAULT_ACTIVE_WATCHER_DAYS;
+		}
+		$days = (string)$this->getOption( 'active-watcher-days' );
+		// 0 would switch the protection off, so it is refused like any typo.
+		if ( !ctype_digit( $days ) || (int)$days < 1 ) {
+			$this->fatalError( "--active-watcher-days takes a positive whole number of days, got '$days'." );
 		}
 		return (int)$days;
 	}
@@ -358,6 +430,14 @@ class RemoveNonEditorUsers extends Maintenance {
 			$this->fatalError( "Cannot read $table on $wiki: " . $e->getMessage()
 				. "\nRefusing to continue: every farm wiki must be fully readable." );
 		}
+		return $this->toIdSet( $ids );
+	}
+
+	/**
+	 * @param array $ids
+	 * @return array<int,true>
+	 */
+	private function toIdSet( array $ids ): array {
 		$set = [];
 		foreach ( $ids as $id ) {
 			if ( $id !== null ) {
@@ -365,6 +445,49 @@ class RemoveNonEditorUsers extends Maintenance {
 			}
 		}
 		return $set;
+	}
+
+	/**
+	 * User IDs of the active watchers on one wiki, optionally limited to some users.
+	 *
+	 * An active watcher watches a page whose latest revision is inside the
+	 * window, and its wl_notificationtimestamp for that page is either inside
+	 * the window too (a change was flagged to it, and an email may have gone
+	 * out) or NULL (it viewed the page after that change).
+	 *
+	 * The NULL test errs on the safe side. Edits that never reach
+	 * recentchanges, such as the redirect fixer's, never stamp watchers, so a
+	 * NULL after such an edit does not prove a visit. The account is then kept
+	 * although it may never have looked.
+	 *
+	 * @param IReadableDatabase $db
+	 * @param string $wiki DB domain, for the error message
+	 * @param int[]|null $userIds Only look for these users; null for all
+	 * @return array<int,true> Set keyed by user ID
+	 */
+	private function fetchActiveWatchers( IReadableDatabase $db, string $wiki, ?array $userIds = null ): array {
+		$cutoff = $db->timestamp( $this->activeWatcherCutoff );
+		$conds = [
+			$db->expr( 'rev_timestamp', '>=', $cutoff ),
+			$db->expr( 'wl_notificationtimestamp', '=', null )
+				->or( 'wl_notificationtimestamp', '>=', $cutoff ),
+		];
+		if ( $userIds !== null ) {
+			$conds['wl_user'] = $userIds;
+		}
+		try {
+			$ids = $db->newSelectQueryBuilder()
+				->select( 'wl_user' )->distinct()
+				->from( 'watchlist' )
+				->join( 'page', null, [ 'page_namespace = wl_namespace', 'page_title = wl_title' ] )
+				->join( 'revision', null, 'rev_id = page_latest' )
+				->where( $conds )
+				->caller( __METHOD__ )->fetchFieldValues();
+		} catch ( DBError $e ) {
+			$this->fatalError( "Cannot read watchlist, page or revision on $wiki: " . $e->getMessage()
+				. "\nRefusing to continue: every farm wiki must be fully readable." );
+		}
+		return $this->toIdSet( $ids );
 	}
 
 	/**
@@ -411,8 +534,9 @@ class RemoveNonEditorUsers extends Maintenance {
 	}
 
 	/**
-	 * Re-check one batch on every wiki's primary just before it is deleted:
-	 * a candidate blocked, or with a new footprint, since the scan must stay.
+	 * Re-check one batch on every wiki's primary just before it is deleted.
+	 * A candidate that, since the scan, was blocked, gained a footprint or an
+	 * edit count, or became an active watcher must stay.
 	 *
 	 * This narrows the window between the scan and the delete to the batch's
 	 * own deletes; it does not lock out a block or edit made during them.
@@ -423,11 +547,16 @@ class RemoveNonEditorUsers extends Maintenance {
 	private function findActedAfterScan( array $batch ): array {
 		$userIds = array_column( $batch, 'user_id' );
 		$actorIds = array_values( array_filter( array_column( $batch, 'actor_id' ) ) );
-		$keep = [];
+		$sharedDbw = $this->getWikiPrimaryDB( $this->wikis[0] );
+		$keep = $this->fetchIdSet( $sharedDbw, $this->wikis[0], 'user', 'user_id', [
+			'user_id' => $userIds,
+			$sharedDbw->expr( 'user_editcount', '>', 0 ),
+		] );
 		$actedActors = [];
 		foreach ( $this->wikis as $wiki ) {
 			$dbw = $this->getWikiPrimaryDB( $wiki );
 			$keep += $this->fetchIdSet( $dbw, $wiki, 'block_target', 'bt_user', [ 'bt_user' => $userIds ] );
+			$keep += $this->fetchActiveWatchers( $dbw, $wiki, $userIds );
 			if ( $actorIds ) {
 				$actedActors += $this->fetchFootprintActors( $dbw, $wiki, $actorIds );
 			}
@@ -442,18 +571,25 @@ class RemoveNonEditorUsers extends Maintenance {
 
 	/**
 	 * @param array<string,int> $layers
-	 * @param int $protected
-	 * @param int $protectedBlocked
+	 * @param array<string,int> $protected Accounts per protection, first match only
+	 * @param int $protectedEdits Total user_editcount of the edit-count protection
 	 */
-	private function printReport( array $layers, int $protected, int $protectedBlocked ): void {
+	private function printReport( array $layers, array $protected, int $protectedEdits ): void {
 		$l1 = $layers[self::LAYER_GROUPED];
 		$l2 = $layers[self::LAYER_WATCHER];
 		$l3 = $layers[self::LAYER_EMAIL];
 		$l4 = $layers[self::LAYER_CORE];
 		$lines = [
 			"\n=== Never-edited users, farm-wide (layers are mutually exclusive) ===",
-			sprintf( '  protected, never deleted        : %6d  (system user, reserved, bot password)', $protected ),
-			sprintf( '  protected, blocked account      : %6d  (block_target on any farm wiki)', $protectedBlocked ),
+			sprintf( '  protected, never deleted        : %6d  (system user, reserved, bot password)',
+				$protected[self::PROTECTED_SYSTEM] ),
+			sprintf( '  protected, blocked account      : %6d  (block_target on any farm wiki)',
+				$protected[self::PROTECTED_BLOCKED] ),
+			sprintf( '  protected, has an edit count    : %6d  (user_editcount > 0, %d edits in total)',
+				$protected[self::PROTECTED_EDIT_COUNT], $protectedEdits ),
+			sprintf( '  protected, active watcher       : %6d  (watched page changed within %d days, '
+				. 'flagged or seen, on any farm wiki)',
+				$protected[self::PROTECTED_ACTIVE_WATCHER], $this->activeWatcherDays ),
 			sprintf( '  L1 holds a user group           : %6d', $l1 ),
 			sprintf( '  L2 no group, watches a page     : %6d', $l2 ),
 			sprintf( '  L3 no group or watch, email conf: %6d', $l3 ),
@@ -478,7 +614,7 @@ class RemoveNonEditorUsers extends Maintenance {
 			$this->fatalError( "Cannot open output file: $path" );
 		}
 		$columns = [ 'user_id', 'actor_id', 'user_name', 'registration', 'touched',
-			'layer', 'has_group', 'is_watcher', 'email_confirmed' ];
+			'layer', 'has_group', 'is_watcher', 'email_confirmed', 'editcount', 'active_watcher' ];
 		fwrite( $fh, implode( "\t", $columns ) . "\n" );
 		foreach ( $candidates as $candidate ) {
 			$fields = [];
